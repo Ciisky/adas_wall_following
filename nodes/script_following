@@ -1,0 +1,556 @@
+#! /usr/bin/env python3
+
+from pickletools import float8
+import rospy
+import math
+import sympy as sym
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Joy
+from tf import transformations
+
+
+var_comand = True           #variabile definita nella funzione di assunzione dei comandi da joypad. Permette che non vengano 
+                            #applicate correzioni dal controllore quando non si sta dando nessun comando al robot
+hz = 10                     #Frequenza pubblicazione del ciclo
+wall_distance = 0.5         #Distanza desiderata dal muro
+max_speed_linear = 0.26     #Velocita' lineare massima raggiungibile dal robot in [m/s]
+max_speed_angular = 1.82    #Velocita' angolare massima raggiungibile dal robot in [rad/s]
+inf = 3.5                   #Range limite attraverso il quale il sensore lidar puo' osservare
+msg_l = LaserScan()         #inizializzazione dei messaggi provenienti dalle funzioni di callback
+msg_joy = Joy()
+coeff_ang = 0               #coefficiente angolare retta
+y_x0 = 0                    #y retta per x=0
+min_index = 0               #inizializzazione primo indice per la definizione del nuro
+succ_index = 0              #inizializzazione indice successivo per la definizione del muro
+x1 = 0                      #inizializzazione delle coordinate e delle ascisse per definire coefficiente angolare e y_x0
+x2 = 0
+y1 = 0
+y2 = 0
+coeff_ang_corner = 0        #inizializzazione parametri per poter definire i parametri della retta necessari a definire l'angolo.. coeff ang, intercetta e punti
+y_x0_corner = 0
+x1_corner = 0
+x2_corner = 0
+y1_corner = 0
+y2_corner = 0
+x_des = 0                   #inizializzazione x_des per il primo ciclo di esecuzione del programma
+y_des = 0                   #inizializzazione y_des per il primo ciclo di esecuzione del programma
+rho = 0                     #inizializzazione rho_x per il primo ciclo di esecuzione del programma
+theta = 0                   #inizializzazione rho_y per il primo ciclo di esecuzione del programma
+kp1 = 0.6                   #guadagno controllore proporzionale per la velocita' linear
+kp2 = 1                     #guadagno controllore proporzionale per la velocita' angolare
+pub_ = None                 #definizione del publisher
+front_leng = 0.1            #lunghezza frontale del robot, da considerare quando effettua le misure dal muro
+back_leng = 0.1             #lunghezza posteriore del robot, da considerare quando effettua le misure dal muro
+chiave = ""                 #inizializzazione della stringa in cui viene collocata la chiave rappresentante la zona di visione
+seq = 0                     #parametro atto all'indicazione di ricezione dei messaggi generati dal joypad al fine di avviare l'esecuzione del main
+x_y0 = float()
+x_y0_toll = float()
+check_angolo = True         #variabile attraverso la quale viene abilitato il calcolo dei parametri della retta che definisce l'angolo
+boole_control_corner = 1    #variabile che inizializza x_y0 e x_y0_toll quando si esce dalla zona di visione dell'angolo
+
+#Suddivisione area di visione dei sensori
+regions_ = {
+        'bright': 0,
+        'right': 0,
+        'fright': 0,
+        'front': 0,
+        'fleft': 0,
+        'left': 0,
+        'bleft': 0,
+        'back': 0,
+}
+
+
+def callback_laser(msg):
+     #Funzione che legge i messaggi provenienti dai sensori e determina la minor distanza
+     #per ciascuna regione in cui e' stata suddivisa l'area di osservazione del robot.
+     #Si tratta di una funzione di callback sottoscritta al topic LaserScan attraverso
+     #un subscriber prima definito
+
+    global regions_, msg_l, chiave
+
+    regions_ = {
+        'bright': min(min(msg.ranges[211:225]), inf),
+        'right': min(min(msg.ranges[226:315]), inf),
+        'fright': min(min(msg.ranges[316:345]), inf),
+        'front': min(min(msg.ranges[346:359] + msg.ranges[0:15]), inf),
+        'fleft': min(min(msg.ranges[16:45]), inf),
+        'left': min(min(msg.ranges[46:135]), inf),
+        'bleft': min(min(msg.ranges[136:150]), inf),
+        'back' : min(min(msg.ranges[151:210]), inf),
+    }
+    chiave = min(regions_, key = regions_.get)
+    # cosi' facendo nella variabile chiave ho memorizzato la regione che al momento presenta
+    # una distanza minore dall'ostacolo. Verificandola rispetto al nome contenuto, potrei scegliere
+    # gli indici da utilizzare.
+    msg_l = msg
+
+
+def retta_muro():
+    #Funzione che utilizza i dati provenienti dalla callback al topic /scan per poter
+    #individuare i coefficienti caratterizzanti di una retta rappresentante il muro che viene individuato
+    #dal robot durante il moto
+
+    global regions_, msg_l, wall_distance, chiave, coeff_ang, y_x0, x1, x2, y1, y2, min_index, succ_index, x1_corner, x2_corner, y1_corner, y2_corner, coeff_ang_corner, y_x0_corner, check_angolo, boole_control_corner
+
+    #Per un muro alla sinistra del robot devo prendere il raggio minore ed un suo successivo
+  
+    if chiave == 'fleft' and  regions_[chiave] < inf:
+        boole_control = 0
+        min_index = 16
+        max_index = 45
+        for i in range(min_index, max_index):
+            if msg_l.ranges[i] < msg_l.ranges[min_index] and msg_l.ranges[i] > 0.12:
+                min_index = i
+
+        succ_index = min_index + 20        
+
+        x1 = msg_l.ranges[min_index]*math.cos(min_index*msg_l.angle_increment)
+        x2 = msg_l.ranges[succ_index]*math.cos(succ_index*msg_l.angle_increment)
+        y1 = msg_l.ranges[min_index]*math.sin(min_index*msg_l.angle_increment)
+        y2 = msg_l.ranges[succ_index]*math.sin(succ_index*msg_l.angle_increment)
+
+        if regions_['fright'] < inf:
+            boole_control_corner = 0
+            check_angolo = False
+            min_index = 316
+            max_index = 345
+            for i in range(min_index, max_index):
+                if msg_l.ranges[i] < msg_l.ranges[min_index] and msg_l.ranges[i] > 0.12:
+                    min_index = i
+        
+            succ_index = min_index - 8   
+                
+            x1_corner = msg_l.ranges[min_index]*math.cos(min_index*msg_l.angle_increment)
+            x2_corner = msg_l.ranges[succ_index]*math.cos(succ_index*msg_l.angle_increment)
+            y1_corner = msg_l.ranges[min_index]*math.sin(min_index*msg_l.angle_increment)
+            y2_corner = msg_l.ranges[succ_index]*math.sin(succ_index*msg_l.angle_increment)
+        
+        else:
+            boole_control_corner = 1
+
+    elif chiave == 'left' and regions_[chiave] < inf:
+        boole_control = 0
+        min_index = 46
+        max_index = 135
+        for i in range(min_index, max_index):
+            if msg_l.ranges[i] < msg_l.ranges[min_index] and msg_l.ranges[i] > 0.12:
+                min_index = i
+        
+        succ_index = min_index + 20
+        
+        x1 = msg_l.ranges[min_index]*math.cos(min_index*msg_l.angle_increment)
+        x2 = msg_l.ranges[succ_index]*math.cos(succ_index*msg_l.angle_increment)
+        y1 = msg_l.ranges[min_index]*math.sin(min_index*msg_l.angle_increment)
+        y2 = msg_l.ranges[succ_index]*math.sin(succ_index*msg_l.angle_increment)
+
+        if regions_['fright'] < inf:
+            boole_control_corner = 0
+            check_angolo = False
+            min_index = 316
+            max_index = 345
+            for i in range(min_index, max_index):
+                if msg_l.ranges[i] < msg_l.ranges[min_index] and msg_l.ranges[i] > 0.12:
+                    min_index = i        
+        
+            succ_index = min_index - 8
+                
+            x1_corner = msg_l.ranges[min_index]*math.cos(min_index*msg_l.angle_increment)
+            x2_corner = msg_l.ranges[succ_index]*math.cos(succ_index*msg_l.angle_increment)
+            y1_corner = msg_l.ranges[min_index]*math.sin(min_index*msg_l.angle_increment)
+            y2_corner = msg_l.ranges[succ_index]*math.sin(succ_index*msg_l.angle_increment) 
+        
+        else:
+            boole_control_corner = 1       
+            
+    elif chiave == 'bleft' and regions_[chiave] < inf:
+        boole_control = 0
+        min_index = 136
+        max_index = 150
+        for i in range(min_index, max_index):
+            if msg_l.ranges[i] < msg_l.ranges[min_index] and msg_l.ranges[i] > 0.12:
+                min_index = i
+
+        succ_index = min_index + 20
+                
+        x1 = msg_l.ranges[min_index]*math.cos(min_index*msg_l.angle_increment)
+        x2 = msg_l.ranges[succ_index]*math.cos(succ_index*msg_l.angle_increment)
+        y1 = msg_l.ranges[min_index]*math.sin(min_index*msg_l.angle_increment)
+        y2 = msg_l.ranges[succ_index]*math.sin(succ_index*msg_l.angle_increment)
+
+        if regions_['fright'] < inf:
+            boole_control_corner = 0
+            check_angolo = False
+            min_index = 316
+            max_index = 345
+            for i in range(min_index, max_index):
+                if msg_l.ranges[i] < msg_l.ranges[min_index] and msg_l.ranges[i] > 0.12:
+                    min_index = i
+        
+            succ_index = min_index - 8
+                
+            x1_corner = msg_l.ranges[min_index]*math.cos(min_index*msg_l.angle_increment)
+            x2_corner = msg_l.ranges[succ_index]*math.cos(succ_index*msg_l.angle_increment)
+            y1_corner = msg_l.ranges[min_index]*math.sin(min_index*msg_l.angle_increment)
+            y2_corner = msg_l.ranges[succ_index]*math.sin(succ_index*msg_l.angle_increment)
+        
+        else:
+            boole_control_corner = 1
+    
+    #Per un muro alla destra del robot, devo prendere un raggio minore ed un suo precedente        
+    elif chiave == 'bright' and regions_[chiave] < inf:
+        boole_control = 0
+        min_index = 211
+        max_index = 225
+        for i in range(min_index, max_index):
+            if msg_l.ranges[i] < msg_l.ranges[min_index] and msg_l.ranges[i] > 0.12:
+                min_index = i
+
+        succ_index = min_index - 20        
+                
+        x1 = msg_l.ranges[min_index]*math.cos(min_index*msg_l.angle_increment)
+        x2 = msg_l.ranges[succ_index]*math.cos(succ_index*msg_l.angle_increment)
+        y1 = msg_l.ranges[min_index]*math.sin(min_index*msg_l.angle_increment)
+        y2 = msg_l.ranges[succ_index]*math.sin(succ_index*msg_l.angle_increment)
+
+        if regions_['fleft'] < inf:
+            boole_control_corner = 0
+            check_angolo = False
+            min_index = 16
+            max_index = 45
+            for i in range(min_index, max_index):
+                if msg_l.ranges[i] < msg_l.ranges[min_index] and msg_l.ranges[i] > 0.12:
+                    min_index = i
+
+            succ_index = min_index + 8            
+
+            x1_corner = msg_l.ranges[min_index]*math.cos(min_index*msg_l.angle_increment)
+            x2_corner = msg_l.ranges[succ_index]*math.cos(succ_index*msg_l.angle_increment)
+            y1_corner = msg_l.ranges[min_index]*math.sin(min_index*msg_l.angle_increment)
+            y2_corner = msg_l.ranges[succ_index]*math.sin(succ_index*msg_l.angle_increment)
+        
+        else:
+            boole_control_corner = 1
+
+    elif chiave == 'right' and regions_[chiave] < inf:
+        boole_control = 0
+        min_index = 226
+        max_index = 315
+        for i in range(min_index, max_index):
+            if msg_l.ranges[i] < msg_l.ranges[min_index] and msg_l.ranges[i] > 0.12:
+                min_index = i
+                
+        succ_index = min_index - 20
+
+        x1 = msg_l.ranges[min_index]*math.cos(min_index*msg_l.angle_increment)
+        x2 = msg_l.ranges[succ_index]*math.cos(succ_index*msg_l.angle_increment)
+        y1 = msg_l.ranges[min_index]*math.sin(min_index*msg_l.angle_increment)
+        y2 = msg_l.ranges[succ_index]*math.sin(succ_index*msg_l.angle_increment)  
+
+        if regions_['fleft'] < inf:
+            boole_control_corner = 0
+            check_angolo = False
+            min_index = 16
+            max_index = 45
+            for i in range(min_index, max_index):
+                if msg_l.ranges[i] < msg_l.ranges[min_index] and msg_l.ranges[i] > 0.12:
+                    min_index = i
+            
+            succ_index = min_index + 8
+            
+            x1_corner = msg_l.ranges[min_index]*math.cos(min_index*msg_l.angle_increment)
+            x2_corner = msg_l.ranges[succ_index]*math.cos(succ_index*msg_l.angle_increment)
+            y1_corner = msg_l.ranges[min_index]*math.sin(min_index*msg_l.angle_increment)
+            y2_corner = msg_l.ranges[succ_index]*math.sin(succ_index*msg_l.angle_increment)
+        
+        else:
+            boole_control_corner = 1 
+
+    elif chiave == 'fright' and regions_[chiave] < inf:
+        boole_control = 0
+        min_index = 316
+        max_index = 345
+        for i in range(min_index, max_index):
+            if msg_l.ranges[i] < msg_l.ranges[min_index] and msg_l.ranges[i] > 0.12:
+                min_index = i
+                
+        succ_index = min_index - 20
+                
+        x1 = msg_l.ranges[min_index]*math.cos(min_index*msg_l.angle_increment)
+        x2 = msg_l.ranges[succ_index]*math.cos(succ_index*msg_l.angle_increment)
+        y1 = msg_l.ranges[min_index]*math.sin(min_index*msg_l.angle_increment)
+        y2 = msg_l.ranges[succ_index]*math.sin(succ_index*msg_l.angle_increment)
+
+        if regions_['fleft'] < inf:
+            boole_control_corner = 0
+            check_angolo = False
+            min_index = 16
+            max_index = 45
+            for i in range(min_index, max_index):
+                if msg_l.ranges[i] < msg_l.ranges[min_index] and msg_l.ranges[i] > 0.12:
+                    min_index = i
+            
+            succ_index = min_index + 8
+
+            x1_corner = msg_l.ranges[min_index]*math.cos(min_index*msg_l.angle_increment)
+            x2_corner = msg_l.ranges[succ_index]*math.cos(succ_index*msg_l.angle_increment)
+            y1_corner = msg_l.ranges[min_index]*math.sin(min_index*msg_l.angle_increment)
+            y2_corner = msg_l.ranges[succ_index]*math.sin(succ_index*msg_l.angle_increment)
+        
+        else:
+            boole_control_corner = 1
+
+    else:
+        boole_control = 1
+
+    if boole_control == 0:
+        coeff_ang = (y2 - y1)/(x2 - x1)         #definizione del coefficiente angolare della retta rappresentante il muro
+        y_x0 = (x2*y1 - x1*y2)/(x2 - x1)        #definizione intercetta della retta            
+        if boole_control_corner == 0:           #abilitazione al calcolo dei coefficienti per la retta che definisce l'angolo
+            coeff_ang_corner = (y2_corner - y1_corner)/(x2_corner - x1_corner)
+            y_x0_corner = (x2_corner*y1_corner - x1_corner*y2_corner)/(x2_corner - x1_corner)
+        
+        else:
+            coeff_ang_corner = 0
+            y_x0_corner = 0
+    
+    else:
+        coeff_ang  = 0
+        y_x0 = 0
+        coeff_ang_corner = 0
+        y_x0_corner = 0
+
+    #print("x1 vale ", x1)
+    #print("x2 vale ", x2)
+    #print("y1 vale ", y1)
+    #print("y2 vale ", y2)
+
+
+def callback_joypad(msg1):
+    # Funzione di callback utilizzata per leggere i data pubblicati dal joypad sul topic joy, affinche' vengano utilizzati per
+    # per definire il punto che si vuole far raggiungere al robot attraverso la definizione di rho e theta. 
+    
+    global  msg_joy
+
+    msg_joy = msg1
+
+
+def rho_and_theta():
+    #Definisco una funzione che attraverso il messaggio della funzione di callback del topic joy, refinisce il modulo e l'inclinazione dell vettore che congiunge l'origine del
+    #sistema di riferimento del robot ed il punto che voglio raggiungere 
+
+    global msg_joy, rho, theta, var_comand
+    
+    rho = math.sqrt(pow(msg_joy.axes[4],2) + pow(msg_joy.axes[3],2))   # ATTENZIONE: bisognerebbe moltiplicare il tutto per un coefficiente che rappresenti quanto equivalga in modulo massimo che possa avere rho. Sostanzialmente questa deve essere scalata 
+    theta = math.atan2(msg_joy.axes[3], msg_joy.axes[4])
+    
+    #con un controllo su rho, viene abilitata o disattivata la possibilita' du pubblicare comandi sul topic /cmd_vel nel caso in cui non si stiano dando comandi al robot.
+    #cosi' facendo si evita che l'algoritmo di wall_following intervenga da solo anche mentre non abbiamo il controllo del mezzo
+    if rho != 0:
+        var_comand = False
+    
+    else:
+        var_comand = True
+
+def control_state():
+    # Funzione che attraverso i dati proveninenti dal joystick e dai coeffiecienti calcolati per definire la retta (muro),
+    # verifica se il punto che si vuole raggiungere sia o non sia accettabile
+    
+    global coeff_ang, y_x0, rho, theta, x_des, y_des, wall_distance, regions_, chiave, var_comand, coeff_ang_corner, y_x0_corner, check_angolo, x_y0, x_y0_toll, boole_control_corner
+   
+    rho_x = rho*math.cos(theta)
+    rho_y = rho*math.sin(theta)         #ottengo le componenti lungo x e y del vettore posizione imposto attraverso la leva di comando
+
+    #nel seguente if viene verificata la condizione di perpendicolarita' dell'asse Xr rispetto al muro e vengono definite le variazioni da applicare su rho_x e rho_y in tale situazione
+    if regions_['front'] < regions_['left'] and regions_['front'] < regions_['right'] and regions_['front'] < wall_distance*1.3:
+        max_rho_x = regions_['front'] - (wall_distance + front_leng)
+        if max_rho_x > 0.05:
+            if rho_x > max_rho_x:
+                rho_x = max_rho_x
+                rho_y = 0          
+            
+            else: 
+                rho_x = rho_x
+        
+        else:
+            if rho_x > 0:
+                rho_x = 0
+                rho_y = 0
+            
+            else:
+                rho_x = rho_x
+        rospy.loginfo("Il robot e' perpendicolare al muro")
+    # Per shiftare la retta, se y_x0 e' positivo, a questo devo sottrargli un valore pari alla distanza desiderata tra le due rette diviso il seno del angolo corrispondente al coeffience
+    # angolare che caratterizza la retta del muro, moltiplicando il tutto poi per il coefficente angolare. Invece nel caso in cui y_x0 risultasse essere negativo, sara' necessario sommargli la medesima quantita' per effettuare lo shift. Quindi per 
+    # il calcolo della coordinata del muro shiftata mi bastera' calcolare l'equazione considerando i parametri caratterizzanti la retta ed la distanza desiderata.
+    #rospy.loginfo(coeff_ang)
+    if y_x0 > 0:
+        y_wall_shif = coeff_ang*rho_x + y_x0 - (wall_distance/(math.sin(math.atan(coeff_ang))))*coeff_ang     # defizione y_wall gia' shiftata rispetto alla componente lungo l'asse x di rho nel caso in cui y_x0 > 0
+        #print('y_x0 vale ', y_x0)
+    
+    elif y_x0 < 0:
+        y_wall_shif = coeff_ang*rho_x + y_x0 + (wall_distance/(math.sin(math.atan(coeff_ang))))*coeff_ang       # definizione di y_wall gia' shiftata rispetto alla componente lungo l'asse x di rho nel caso in cui y_x0 < 0
+        #print('y_x0 vale ', y_x0)
+    
+    else:
+        y_wall_shif = 0
+        #print(y_wall_shif) 
+          
+    # Effettuo due verifiche: innanzitutto vedo se sia la componente y di rho che sia la componente y_wall_shiftata sia minori di zero, in questo caso valuto i valori assoluti e non i valori reali.
+    # Il secondo controllo che effettuo, utile proprio alle necessita' del progetto, e' quello di verificare se la coordinata y che voglio raggiungere, vada oltre il muro. Nel caso in cui si vada oltre la retta rappresentate
+    # il muro shiftato, il valore verra' forzato a quello della retta.  
+    
+    if var_comand == False:
+        if y_wall_shif != 0 and y_x0 >= 0:   #verifica sulle condizioni quando retta rappresentante il muro abbia una q > 0
+            if y_wall_shif > 0 and rho_y >= 0:
+                if y_wall_shif > rho_y:
+                    rho_y = rho_y
+                
+                else:
+                    rho_y = y_wall_shif
+                    rospy.loginfo(1)
+            
+            elif y_wall_shif < 0 and rho_y >= 0:
+                rho_y = y_wall_shif
+                rospy.loginfo(2)
+            
+            elif y_wall_shif < 0 and rho_y <= 0:
+                if abs(y_wall_shif) > abs(rho_y):
+                    rho_y = y_wall_shif
+                    rospy.loginfo(3)
+                
+                else:
+                    rho_y = rho_y
+
+        elif y_wall_shif != 0 and y_x0 < 0:   #verifica sulle condizioni quando la retta rappresentante il muro abbia una q < 0
+            if y_wall_shif > 0 and rho_y <= 0:
+                rho_y = y_wall_shif
+                rospy.loginfo(4)
+
+            elif y_wall_shif < 0 and rho_y <= 0:
+                if abs(y_wall_shif) > abs(rho_y):
+                    rho_y = rho_y
+                
+                else:
+                    rho_y = y_wall_shif
+                    rospy.loginfo(5)
+
+            elif y_wall_shif > 0 and rho_y >= 0:
+                if y_wall_shif < rho_y:
+                    rho_y = rho_y
+                
+                else:
+                    rho_y = y_wall_shif
+                    rospy.loginfo(6)
+
+    #verificato che ci si trovi nella condizione in cui viene identificato un angolo, viene calcolata l'ascissa per y=0 della seconda retta shiftata della wall_distance
+    #a cui viene sommata una tolleranza
+    if check_angolo == False:
+        if y_x0_corner > 0:
+            x_y0 = -(y_x0_corner - ((wall_distance + 0.05)/(math.sin(math.atan(coeff_ang_corner))))*coeff_ang_corner)/coeff_ang_corner
+            x_y0_toll = -(y_x0_corner - ((wall_distance + 0.15)/(math.sin(math.atan(coeff_ang_corner))))*coeff_ang_corner)/coeff_ang_corner
+        
+        elif y_x0_corner < 0:
+            x_y0 = -(y_x0_corner + ((wall_distance + 0.05)/(math.sin(math.atan(coeff_ang_corner))))*coeff_ang_corner)/coeff_ang_corner
+            x_y0_toll = -(y_x0_corner + ((wall_distance + 0.15)/(math.sin(math.atan(coeff_ang_corner))))*coeff_ang_corner)/coeff_ang_corner
+
+    if boole_control_corner == 1:
+        x_y0 = 0
+        x_y0_toll = 0
+    
+
+    print(x_y0)
+    print(x_y0_toll)    
+
+    #si effettua un controllo che verifica se il robot abbia oltrepassato la retta shiftata del secondo muro; in tal caso in robot viene fermato ed e' concesso di proseguire esclusivamente
+    #in retromarcia per eventualmente ingaggiare l'angolo
+    if x_y0_toll < 0:
+        if rho_x > 0:
+            rho_x = 0
+            rho_y = 0
+        
+        else:
+            rho_x = rho_x
+            rho_y = 0
+
+    x_des = rho_x
+    y_des = rho_y
+
+    
+def control_action():
+    # Funzione che mi permette di definire l'azione di controllo da applicare al robot affinche' venga raggiunto
+    # il punto desiderato e venga annullato anche l'angolo tra l'asse Xr del robot e l'input di inclinazione assegnato.
+    # In particolare, attraverso l'uso di due semplici controlloro proporzionali (al momento tarati casualmente) a
+    # cui venogno assegnati come errori di input il modulo del vettore ottenuto tramite le componenti x_des e y_des e 
+    # l'angolo come l'atan2 delle due componenti
+
+    global  theta, rho, x_des, y_des, err_angular, err_linear
+
+    err_linear = math.sqrt(pow(x_des, 2) + pow(y_des, 2))
+    err_angular = math.atan2(y_des, x_des)
+
+    move = Twist()
+
+    if x_des <= 0.05 and x_des >= -0.05 and y_des != 0:
+        move.linear.x = 0
+        move.angular.z = 0
+    
+    else:
+        if x_des > 0:
+            move.linear.x = max(min(kp1*err_linear, max_speed_linear), -max_speed_linear)
+            move.angular.z = max(min(kp2*err_angular, max_speed_angular), -max_speed_angular)
+        
+        elif x_des < 0 and regions_['back'] > wall_distance + back_leng:
+            move.linear.x = -max(min(kp1*err_linear, max_speed_linear), -max_speed_linear)
+            if y_des > 0:
+                move.angular.z = max(min(kp2*err_angular - math.pi, max_speed_angular), -max_speed_angular)
+            
+            elif y_des < 0:
+                move.angular.z = max(min(kp2*err_angular + math.pi, max_speed_angular), -max_speed_angular)
+        
+        else:
+            move.linear.x = 0
+            move.angular.z = 0
+    
+    return move
+    # Nelle righe di codice che vanno da 514 a 519 viene apportata una piccola modifica nella definizione dell'errore necessario al calcolo della velocita' 
+    # In particolare, poiche' il controllo e' realizzato in maniera tale che l'asse Xr si allinei con il vettore che congiunge origine e punto desiderato, quando si procede in retromarcia, 
+    # per come e' definita la funzione atan2, viene sommato e sottrato un angolo pari a pi/2. Tale situazione produce l'impossibilita' all'esecuzione di un controllo corretto. Per ovviare 
+    # tale problematica e' stato neccessario, in tale situazione, sommare e sottrare rispettivamente un angolo uguale ed opposto 
+
+def main():
+    
+    global hz, pub_, x_des, y_des, rho, theta, regions_, coeff_ang, y_x0, wall_distance, msg_l, msg_joy, r_t_control,seq
+
+    rospy.init_node('wall_following', anonymous= True)
+    
+    rate = rospy.Rate(hz)
+    sub2 = rospy.Subscriber('/joy', Joy, callback_joypad) 
+    sub1 = rospy.Subscriber('/scan', LaserScan, callback_laser)
+    pub_ = rospy.Publisher('/cmd_vel', Twist, queue_size = 1)
+
+    while not rospy.is_shutdown():
+        if msg_joy.header.stamp.secs != 0:
+            if msg_joy.header.seq != seq:
+                retta_muro()
+                rho_and_theta()
+                control_state()
+                move_main = Twist()
+                move_main = control_action()         
+                pub_.publish(move_main)
+                seq = msg_joy.header.seq
+            
+            else:
+                move_main = Twist()
+                move_main.linear.x = 0
+                move_main.angular.z = 0
+                pub_.publish(move_main)
+        rate.sleep()
+
+if __name__ == '__main__':
+    try:
+        main()
+    except rospy.ROSInterruptException:
+        pass
+    
