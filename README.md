@@ -1,2 +1,5 @@
 # adas_wall_following
-Sviluppo di un algoritmo di Wall Following assistivo (A.D.A.S.) per il progetto di tesi magistrale in "Robotica Mobile" presso il Politecnico di Bari
+Sviluppo di un algoritmo di Wall Following assistivo (A.D.A.S.) per il progetto di tesi magistrale in "Robotica Mobile" presso il Politecnico di Bari.
+Per il progetto di è richiesto di sviluppare un software assistenziale di guida da applicare su robot mobili a guida differenziale. In particolare, considerando il caso di utilizzo degli stessi da parte di un operatore umano all'interno di uno stabilimento industriale, si è voluto evitare che in caso di errore di utilizzo da parte dell'operatore che il robot vada a collidire contro le pareti.
+Quando viene rilevata questa possibilità, l'algoritmo interviene sulla traiettoria portando il robot a dispostirsi parallelamente al muro ed a continuare il proprio cammino. Nel caso in cui l'operatore continui a richiedere al robot di dirigersi verso il muro, l'algoritmo continuerà a negare il controllo all'operatore, in caso contrario la parte umana a gestione del mezzo potrà tranquillamente riprendere il controllo. 
+Per simulare il tutto è stato utilizzato ROS, come modello di simulazione è stato impiegato un robot Turtlebot3 Waffle e per il controllo dello stesso un Sony Dualshock 4.
