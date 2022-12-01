@@ -1,0 +1,369 @@
+#! /usr/bin/env python3
+
+import rospy
+import math
+import numpy as np
+from sensor_msgs.msg import PointCloud2
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Joy
+import ros_numpy as ros_np
+import time
+
+
+class Wall_Following():
+
+    def __init__(self, distanza_desiderata, max_velocita_lineare, max_velocita_angolare, portata_sensori, larghezza, lunghezza_ant, lunghezza_post):
+        rospy.init_node('wall_following_node', anonymous = True)
+        self.pub = rospy.Publisher('cmd_vel', Twist, queue_size = 10)
+        self.sub1 = rospy.Subscriber('joy', Joy, self.callback_joypad) 
+        self.sub2 = rospy.Subscriber('TOPIC MMWAVE DESTRO', PointCloud2, self.callback_pointcloud_dx)
+        self.sub3 = rospy.Subscriber('TOPIC MMWAVE SINISTRO', PointCloud2, self.callback_pointcloud_sx)
+        self.sub4 = rospy.Subscriber('TOPIC MMWAVE FRONTALE', PointCloud2, self.callback_pointcloud_fx)    
+        self.rate = rospy.Rate(10)
+        self.wall_distance = distanza_desiderata
+        self.max_speed_linear = max_velocita_lineare
+        self.max_speed_angular = max_velocita_angolare
+        self.inf = portata_sensori
+        self.width = larghezza
+        self.length_fx = lunghezza_ant
+        self.length_px = lunghezza_post
+        self.kp1 = 0.6                                  # coefficiente primo controllore proporzionale
+        self.kp2 = 1                                    # coefficiente secondo controllore proporzionale                                     
+        self.msg_joy = Joy()                            # inizializzazione messaggio funzione callback joypad
+        self.coeff_ang = 0                              # coefficiente angolare retta
+        self.y_x0 = 0                                   # y retta per x = 0
+        self.coeff_ang_corner = 0                       # coefficiente angolare seconda retta
+        self.y_x0_corner = 0                            # y seconda retta per x = 0
+        self.x_des = 0                                  # coordinata x da raggiungere
+        self.y_des = 0                                  # coordinata y da raggiungere
+        self.rho = 0                                    # modulo vettore letto dal joystick
+        self.theta = 0                                  # angolo tra il vettore e l'asse X_r
+        self.chiave = ''                                # chiave del dizionario
+        self.seq = 0                                    # sequenza messaggi Joy
+        self.x_y0_toll = 0                              # x seconda retta per y = 0
+        self.var_comand = None                          # variabile di abilitazione al controllo tramite joystick
+        self.boole_control = None                       # variabile di abilitazione al calcolo dei coefficienti della prima retta
+        self.boole_control_corner = None                # variabile di abilitazione al calcolo dei coefficienti della seconda retta
+        self.xyz_dx_x = np.array([])                    # inizializzazione array coordinate nuvole punti 
+        self.xyz_dx_y = np.array([])
+        self.xyz_sx_x = np.array([])
+        self.xyz_sx_y = np.array([])
+        self.xyz_fx_x = np.array([])
+        self.xyz_fx_y = np.array([])
+        self.contatore_sx = 0
+        self.contatore_dx = 0
+        self.contatore_fx = 0
+        self.regions = {                                # suddivisione area di visione dei sensori
+                        'right': 0,
+                        'left': 0,
+                        'front':0
+        }
+
+    def callback_joypad(self, msg1):
+        # Funzione di callback utilizzata per leggere i data pubblicati dal joypad sul topic joy, affinche' vengano utilizzati per
+        # per definire il punto che si vuole far raggiungere al robot attraverso la definizione di rho e theta. 
+
+        self.msg_joy = msg1
+
+    def callback_pointcloud_dx(self, msg2):
+        # Funzione di callback sottoscritta al topic del MMWave destro 
+
+        xyz_dx = ros_np.point_cloud2.pointcloud2_to_xyz_array(msg2)
+        self.xyz_dx_x = np.append(self.xyz_dx_x, xyz_dx[0])
+        self.xyz_dx_y = np.append(self.xyz_dx_y, xyz_dx[1])
+        self.contatore_dx += 1
+
+    def callback_pointcloud_sx(self, msg3):
+        # Funzione di callback sottoscritta al topic del MMWave sinistro 
+    
+        xyz_sx = ros_np.point_cloud2.pointcloud2_to_xyz_array(msg3)
+        self.xyz_sx_x = np.append(self.xyz_sx_x, xyz_sx[0])
+        self.xyz_sx_y = np.append(self.xyz_sx_y, xyz_sx[1])
+        self.contatore_sx += 1
+
+    def callback_pointcloud_fx(self, msg4):
+        # Funzione di callback sottoscritta al topic del MMWave frontale
+
+        xyz_fx = ros_np.point_cloud2.pointcloud2_to_xyz_array(msg4)
+        self.xyz_fx_x = np.append(self.xyz_fx_x, xyz_fx[0])
+        self.xyz_fx_y = np.append(self.xyz_fx_y, xyz_fx[1])
+        self.contatore_fx += 1
+
+    def identificazione_zona(self):
+        # Funzione che estrae le coordinate di tutti i punti individuati dai sensori e indentifica, dopo averne calcolata la distanza euclidea,
+        # quale sensore stia misurando i punti piu' prossimi al robot
+    
+        dist_robot_dx = np.hypot(self.xyz_dx_x, self.xyz_dx_y)
+        dist_robot_sx = np.hypot(self.xyz_sx_x, self.xyz_sx_y)
+        dist_robot_fx = np.hypot(self.xyz_fx_x, self.xyz_fx_y)
+
+        self.regions = {
+            'right': min(min(dist_robot_dx), self.inf),
+            'front': min(min(dist_robot_sx), self.inf),
+            'left': min(min(dist_robot_fx), self.inf)
+        }
+        self.chiave = min(self.regions, key = self.regions.get)     # nella variabile chiave memorizzo la regione che al momento presenta la distanza minore dell'ostacolo
+ 
+    def retta_muro(self):
+        # Funzione che utilizza i dati provenienti dalla callback al topic /scan per poter
+        # individuare i coefficienti caratterizzanti di una retta rappresentante il muro che viene individuato
+        # dal robot durante il moto
+    
+        if self.chiave == 'left' and  self.regions[self.chiave] < self.inf:
+            self.boole_control = True        
+            cov = np.cov(self.xyz_sx_x, self.xyz_sx_y, bias=True)[0][1]
+            vari = np.var(self.xyz_sx_x)
+            y_mean = np.mean(self.xyz_sx_y)
+            x_mean = np.mean(self.xyz_sx_x)
+
+            if self.regions['front'] < self.inf:
+                self.boole_control_corner = True
+                cov_corn = np.cov(self.xyz_fx_x, self.xyz_fx_y, bias=True)[0][1]
+                vari_corn = np.var(self.xyz_fx_x)
+                y_mean_corn = np.mean(self.xyz_fx_y)
+                x_mean_corn = np.mean(self.xyz_fx_x)
+            else:
+                self.boole_control_corner = False  
+               
+        elif self.chiave == 'right' and self.regions[self.chiave] < self.inf:
+            self.boole_control = True
+            cov = np.cov(self.xyz_dx_x, self.xyz_dx_y, bias=True)[0][1]
+            vari = np.var(self.xyz_dx_x)
+            y_mean = np.mean(self.xyz_dx_y)      
+            x_mean = np.mean(self.xyz_dx_x)
+
+            if self.regions['front'] < self.inf:
+                self.boole_control_corner = True
+                cov_corn = np.cov(self.xyz_fx_x, self.xyz_fx_y, bias=True)[0][1]
+                vari_corn = np.var(self.xyz_fx_x)
+                y_mean_corn = np.mean(self.xyz_fx_y)
+                x_mean_corn = np.mean(self.xyz_fx_x)
+
+            else:
+                self.boole_control_corner = False 
+
+        elif self.chiave == 'front' and self.regions[self.chiave] < self.inf:
+            self.boole_control = True
+            cov = np.cov(self.xyz_fx_x, self.xyz_fx_y, bias=True)[0][1]
+            vari = np.var(self.xyz_fx_x)
+            y_mean = np.mean(self.xyz_fx_y)                
+            x_mean = np.mean(self.xyz_fx_x)
+            self.boole_control_corner = False
+
+        else:
+            self.boole_control = False
+
+        if self.boole_control == True:
+            self.coeff_ang = cov/vari         #definizione del coefficiente angolare della retta rappresentante il muro
+            self.y_x0 = y_mean - self.coeff_ang*x_mean
+        
+            if self.boole_control_corner == True:
+                self.coeff_ang_corner = cov_corn/vari_corn
+                self.y_x0_corner = y_mean_corn - self.coeff_ang_corner*x_mean_corn
+            else:
+                self.coeff_ang_corner = 0
+                self.y_x0_corner = 0
+        
+        else:
+            self.coeff_ang  = 0
+            self.y_x0 = 0
+            self.coeff_ang_corner = 0
+            self.y_x0_corner = 0
+    
+        print("Il valore del coefficiente angolare e' ", self.coeff_ang_corner)
+        print("Il valore di y_x0 e' ", self.y_x0_corner)
+
+
+    def rho_and_theta(self):
+        # Funzione utilizzata per identificare sia il modulo del vettore congiungente il punto che si vuole raggiungere e l'origine del sistema di riferimento, sia l'angolo tra lo stesso
+        # vettore e l'asse Xr del robot
+    
+        #self.rho = math.sqrt(pow(self.msg_joy.axes[4],2) + pow(self.msg_joy.axes[3],2))   # ATTENZIONE: bisognerebbe moltiplicare il tutto per un coefficiente che rappresenti quanto equivalga in modulo massimo che possa avere rho. Sostanzialmente questa deve essere scalata 
+        self.rho = math.hypot(self.msg_joy.axes[4], self.msg_joy.axes[3])
+        self.theta = math.atan2(self.msg_joy.axes[3], self.msg_joy.axes[4])
+    
+        if self.rho != 0:
+            self.var_comand = True
+        else:
+            self.var_comand = False
+
+
+    def control_state(self):
+        # Funzione che attraverso i dati proveninenti dal joystick e dai coeffiecienti calcolati per definire la retta (muro),
+        # verifica se il punto che si vuole raggiungere sia o non sia accettabile
+   
+        rho_x = self.rho*math.cos(self.theta)
+        rho_y = self.rho*math.sin(self.theta)         #ottengo le componenti lungo x e y del vettore posizione imposto attraverso la leva di comando
+
+        if self.regions['front'] < self.regions['left'] and self.regions['front'] < self.regions['right'] and self.regions['front'] < self.wall_distance*1.3:
+            max_rho_x = self.regions['front'] - (self.wall_distance + self.length_fx)
+            if max_rho_x > 0.05:
+                if rho_x > max_rho_x:
+                    rho_x = max_rho_x
+                    rho_y = 0           #se non dovessere funzionare, cancellare le 3 rho_y = 0 commentate
+                else: 
+                    rho_x = rho_x
+                #rho_y = 0          
+            else:
+                if rho_x > 0:
+                    rho_x = 0
+                    rho_y = 0
+                else:
+                    rho_x = rho_x
+                    #rho_y = 0     
+            #print("il valore di rho_x e': ", rho_x)
+            #print("il valore di rho_y e': ", rho_y)
+            rospy.loginfo("Il robot e' perpendicolare al muro")
+
+        # Per shiftare la retta, se y_x0 e' positivo, a questo devo sottrargli un valore pari alla distanza desiderata tra le due rette diviso il seno del angolo corrispondente al coeffience
+        # angolare che caratterizza la retta del muro, moltiplicando il tutto poi per il coefficente angolare. Invece nel caso in cui y_x0 risultasse essere negativo, sara' necessario sommargli la medesima quantita' per effettuare lo shift. Quindi per 
+        # il calcolo della coordinata del muro shiftata mi bastera' calcolare l'equazione considerando i parametri caratterizzanti la retta ed la distanza desiderata.
+        #rospy.loginfo(coeff_ang)
+
+        if self.y_x0 > 0:
+            y_wall_shif = self.coeff_ang*rho_x + self.y_x0 - ((self.wall_distance + self.width/2) /(math.sin(math.atan(self.coeff_ang))))*self.coeff_ang     # defizione y_wall gia' shiftata rispetto alla componente lungo l'asse x di rho nel caso in cui y_x0 > 0
+
+        elif self.y_x0 < 0:
+            y_wall_shif = self.coeff_ang*rho_x + self.y_x0 + ((self.wall_distance + self.width/2)/(math.sin(math.atan(self.coeff_ang))))*self.coeff_ang       # definizione di y_wall gia' shiftata rispetto alla componente lungo l'asse x di rho nel caso in cui y_x0 < 0
+
+        else:
+            y_wall_shif = 0
+
+        # Effettuo due verifiche: innanzitutto vedo se sia la componente y di rho che sia la componente y_wall_shiftata sia minori di zero, in questo caso valuto i valori assoluti e non i valori reali.
+        # Il secondo controllo che effettuo, utile proprio alle necessita' del progetto, e' quello di verificare se la coordinata y che voglio raggiungere, vada oltre il muro. Nel caso in cui si vada oltre la retta rappresentate
+        # il muro shiftato, il valore verra' forzato a quello della retta.  
+    
+        if self.var_comand == True:
+            if y_wall_shif != 0 and self.y_x0 >= 0:   #verifica sulle condizioni quando retta rappresentante il muro abbia una q > 0
+
+                if y_wall_shif > 0 and rho_y >= 0:
+                    if y_wall_shif > rho_y:
+                        rho_y = rho_y
+                    else:
+                        rho_y = y_wall_shif
+                        rospy.loginfo(1)
+            
+                elif y_wall_shif < 0 and rho_y >= 0:
+                    rho_y = y_wall_shif
+                    rospy.loginfo(2)
+            
+                elif y_wall_shif < 0 and rho_y <= 0:
+                    if abs(y_wall_shif) > abs(rho_y):
+                        rho_y = y_wall_shif
+                        rospy.loginfo(3)
+                    else:
+                        rho_y = rho_y
+
+            elif y_wall_shif != 0 and self.y_x0 < 0:   #verifica sulle condizioni quando la retta rappresentante il muro abbia una q < 0
+
+                if y_wall_shif > 0 and rho_y <= 0:
+                    rho_y = y_wall_shif
+                    rospy.loginfo(4)
+
+                elif y_wall_shif < 0 and rho_y <= 0:
+                    if abs(y_wall_shif) > abs(rho_y):
+                        rho_y = rho_y
+                    else:
+                        rho_y = y_wall_shif
+                        rospy.loginfo(5)
+
+                elif y_wall_shif > 0 and rho_y >= 0:
+                    if y_wall_shif < rho_y:
+                        rho_y = rho_y
+                    else:
+                        rho_y = y_wall_shif
+                        rospy.loginfo(6)
+
+        if self.boole_control_corner == True:
+            if self.y_x0_corner > 0:
+                self.x_y0_toll = -(self.y_x0_corner - ((self.wall_distance + self.width/2)/(math.sin(math.atan(self.coeff_ang_corner))))*self.coeff_ang_corner)/self.coeff_ang_corner
+            elif self.y_x0_corner < 0:
+                self.x_y0_toll = -(self.y_x0_corner + ((self.wall_distance + self.width/2)/(math.sin(math.atan(self.coeff_ang_corner))))*self.coeff_ang_corner)/self.coeff_ang_corner
+        else:
+            self.x_y0_toll = 0
+
+        print(self.x_y0_toll)    
+
+        if self.x_y0_toll < 0:
+            if rho_x > 0:
+                rho_x = 0
+                rho_y = 0
+            else:
+                rho_x = rho_x
+                rho_y = 0
+
+        self.x_des = rho_x
+        self.y_des = rho_y
+        #print('x desiderata vale ', x_des)
+        #print('y desidarata vale ', y_des)   
+        #rospy.loginfo(rho_x)
+        #rospy.loginfo(rho_y)
+
+    def control_action(self):
+        # Funzione che mi permette di definire l'azione di controllo da applicare al robot affinche' venga raggiunto
+        # il punto desiderato e venga annullato anche l'angolo tra l'asse Xr del robot e l'input di inclinazione assegnato.
+        # In particolare, attraverso l'uso di due semplici controlloro proporzionali, aventi in ingresso il modulo del vettore
+        # ottenuto dalle componenti x_des e y_des e l'angolo tra il vettore stesso e l'asse X_r ata2(y_des,x_des)
+    
+        err_linear = math.sqrt(pow(self.x_des, 2) + pow(self.y_des, 2))
+        err_angular = math.atan2(self.y_des, self.x_des)
+
+        #print('Modulo dopo confronto', err_linear)
+        #print('Orientamento dopo confronto', err_angular)
+
+        move = Twist()
+        if self.x_des <= 0.05 and self.x_des >= -0.05 and self.y_des != 0:
+            move.linear.x = 0
+            move.angular.z = 0
+        else:
+            if self.x_des > 0:
+                move.linear.x = max(min(self.kp1*err_linear, self.max_speed_linear), -self.max_speed_linear)
+                move.angular.z = max(min(self.kp2*err_angular, self.max_speed_angular), -self.max_speed_angular)
+            elif self.x_des < 0:
+                move.linear.x = -max(min(self.kp1*err_linear, self.max_speed_linear), -self.max_speed_linear)
+                if self.y_des > 0:
+                    move.angular.z = max(min(self.kp2*err_angular - math.pi, self.max_speed_angular), -self.max_speed_angular)
+                elif self.y_des < 0:
+                    move.angular.z = max(min(self.kp2*err_angular + math.pi, self.max_speed_angular), -self.max_speed_angular)
+            else:
+                move.linear.x = 0
+                move.angular.z = 0
+        return move
+    
+    def main(self):
+
+        while not rospy.is_shutdown():
+            if self.msg_joy.header.stamp.secs != 0:
+                if self.msg_joy.header.seq != self.seq:
+                    if self.contatore_dx >= 3 and self.contatore_fx >= 3 and self.contatore_sx >= 3:
+                        self.identificazione_zona()
+                        self.retta_muro()
+                        self.contatore_dx = 0
+                        self.contatore_fx = 0
+                        self.contatore_fx = 0
+                        self.xyz_dx_x = np.array([])                    
+                        self.xyz_dx_y = np.array([])
+                        self.xyz_sx_x = np.array([])
+                        self.xyz_sx_y = np.array([])
+                        self.xyz_fx_x = np.array([])
+                        self.xyz_fx_y = np.array([])
+                        self.rho_and_theta()
+                        self.control_state()
+                        move_main = Twist()
+                        move_main = self.control_action()         
+                        self.pub.publish(move_main)
+                        self.seq = self.msg_joy.header.seq
+                else:
+                    move_main = Twist()
+                    move_main.linear.x = 0
+                    move_main.angular.z = 0
+                    self.pub.publish(move_main)
+            self.rate.sleep()
+
+if __name__ == '__main__':
+    try:
+        diff_drive = Wall_Following(0.5, 0.26, 1.82, 3.5, 0.28, 0.08, 0.21)
+        diff_drive.main()
+    except rospy.ROSInterruptException:
+        pass
+    

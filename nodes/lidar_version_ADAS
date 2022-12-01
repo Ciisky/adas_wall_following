@@ -1,0 +1,543 @@
+#! /usr/bin/env python3
+
+from pickletools import float8
+import rospy
+import math
+import sympy as sym
+import numpy as np
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Joy
+from tf import transformations
+
+class Wall_following():
+
+    def __init__(self, safe_distance, max_linear_vel, max_angular_vel, sens_dist, width, front_leng, back_leng):
+        rospy.init_node('wall_following_node', anonymous = True)
+        self.pub = rospy.Publisher('cmd_vel', Twist, queue_size = 10)
+        self.sub1 = rospy.Subscriber('/joy', Joy, self.callback_joy)
+        self.sub2 = rospy.Subscriber('/scan_noise', LaserScan, self.callback_lidar)
+        self.rate = rospy.Rate(10)
+        self.wall_distance = safe_distance
+        self.max_speed_linear = max_linear_vel
+        self.max_speed_angular = max_angular_vel
+        self.inf = sens_dist
+        self.kp1 = 0.26
+        self.kp2 = 1
+        self.msg_l = LaserScan()
+        self.msg_joy = Joy()
+        self.coeff_ang = 0
+        self.y_x0 = 0
+        self.coeff_ang_corner = 0
+        self.y_x0_corner = 0
+        self.x_des = 0
+        self.y_des = 0
+        self.front_leng = front_leng
+        self.back_leng = back_leng
+        self.rho = None
+        self.theta = None
+        self.seq = 0
+        self.chiave = ""
+        self.x_y0 = 0
+        self.x_y0_toll = 0
+        self.boole_control_corner = None
+        self.check_angolo = None
+        self.boole_control = None
+        self.var_comand = None
+        self.regions= {
+                        'bright': 0,
+                        'right': 0,
+                        'fright': 0,
+                        'front': 0,
+                        'fleft': 0,
+                        'left': 0,
+                        'bleft': 0,
+        }
+
+
+ 
+    def callback_lidar(self, msg):
+        #Funzione che legge i messaggi provenienti dai sensori e determina la minor
+        #per ciascuna regione in cui e' stata suddivisa l'area di osservazione del robot.
+        #Si tratta di una funzione di callback sottoscritta al topic LaserScan attraverso
+        #un subscriber prima definito
+
+
+        self.regions = {
+                    'bright': min(min(msg.ranges[211:225]), self.inf),
+                    'right': min(min(msg.ranges[226:315]), self.inf),
+                    'fright': min(min(msg.ranges[316:345]), self.inf),
+                    'front': min(min(msg.ranges[346:359] + msg.ranges[0:15]), self.inf),
+                    'fleft': min(min(msg.ranges[16:45]), self.inf),
+                    'left': min(min(msg.ranges[46:135]), self.inf),
+                    'bleft': min(min(msg.ranges[136:150]), self.inf),
+                    'back' : min(min(msg.ranges[151:210]), self.inf),
+                
+        }
+        self.chiave = min(self.regions, key = self.regions.get)
+        self.msg_l = msg
+
+    def retta_muro(self):
+        #Funzione che utilizza i dati provenienti dalla callback al topic /scan per poter
+        #individuare i coefficienti caratterizzanti di una retta rappresentante il muro che viene individuato
+        #dal robot durante il moto
+    
+        #Per un muro alla sinistra del robot devo prendere il raggio minore ed un suo successivo
+  
+        if self.chiave == 'fleft' and  self.regions[self.chiave] < self.inf:
+            x = []
+            y = []
+            self.boole_control = 0
+            min_index = 16
+            max_index = 45
+            for i in range(min_index, max_index):
+                if 0.12 < self.msg_l.ranges[i] < 5:
+                    x.append(self.msg_l.ranges[i]*math.cos(i*self.msg_l.angle_increment))
+                    y.append(self.msg_l.ranges[i]*math.sin(i*self.msg_l.angle_increment))
+    
+            cov = np.cov(x,y, bias=True)[0][1]
+            vari = np.var(x)
+            y_mean = np.mean(y)
+            x_mean = np.mean(x)
+
+            if self.regions['fright'] < self.inf:
+                self.boole_control_corner = 0
+                self.check_angolo = False
+                x_corn = []
+                y_corn = []
+                min_index = 316
+                max_index = 345
+                for i in range(min_index, max_index):
+                    if 0.12 < self.msg_l.ranges[i] < 5:
+                        x_corn.append(self.msg_l.ranges[i]*math.cos(i*self.msg_l.angle_increment))
+                        y_corn.append(self.msg_l.ranges[i]*math.sin(i*self.msg_l.angle_increment))
+        
+                cov_corn = np.cov(x_corn,y_corn, bias=True)[0][1]
+                vari_corn = np.var(x_corn)
+                y_mean_corn = np.mean(y_corn)
+                x_mean_corn = np.mean(x_corn)
+            else:
+                self.boole_control_corner = 1
+
+        elif self.chiave == 'left' and self.regions[self.chiave] < self.inf:
+            x = []
+            y = []
+            self.boole_control = 0
+            min_index = 46
+            max_index = 135
+            for i in range(min_index, max_index):
+                if 0.12 < self.msg_l.ranges[i] < 5:
+                    x.append(self.msg_l.ranges[i]*math.cos(i*self.msg_l.angle_increment))
+                    y.append(self.msg_l.ranges[i]*math.sin(i*self.msg_l.angle_increment))
+
+            cov = np.cov(x,y, bias=True)[0][1]
+            vari = np.var(x)
+            y_mean = np.mean(y)
+            x_mean = np.mean(x)
+
+            if self.regions['fright'] < self.inf:
+                self.boole_control_corner = 0
+                self.check_angolo = False
+                x_corn = []
+                y_corn = []
+                min_index = 316
+                max_index = 345
+                for i in range(min_index, max_index):
+                    if 0.12 < self.msg_l.ranges[i] < 5:
+                        x_corn.append(self.msg_l.ranges[i]*math.cos(i*self.msg_l.angle_increment))
+                        y_corn.append(self.msg_l.ranges[i]*math.sin(i*self.msg_l.angle_increment))
+            
+                cov_corn = np.cov(x_corn,y_corn, bias=True)[0][1]
+                vari_corn = np.var(x_corn)
+                y_mean_corn = np.mean(y_corn)
+                x_mean_corn = np.mean(x_corn)
+ 
+            else:
+                self.boole_control_corner = 1       
+            
+        elif self.chiave == 'bleft' and self.regions[self.chiave] < self.inf:
+            x = []
+            y = [] 
+            self.boole_control = 0
+            min_index = 136
+            max_index = 150
+            for i in range(min_index, max_index):
+                if 0.12 < self.msg_l.ranges[i] < 5:
+                    x.append(self.msg_l.ranges[i]*math.cos(i*self.msg_l.angle_increment))
+                    y.append(self.msg_l.ranges[i]*math.sin(i*self.msg_l.angle_increment))
+        
+            cov = np.cov(x,y, bias=True)[0][1]
+            vari = np.var(x)
+            y_mean = np.mean(y)
+            x_mean = np.mean(x)
+
+            if self.regions['fright'] < self.inf:
+                self.boole_control_corner = 0
+                self.check_angolo = False
+                x_corn = []
+                y_corn = []
+                min_index = 316
+                max_index = 345
+                for i in range(min_index, max_index):
+                    if 0.12 < self.msg_l.ranges[i] < 5:
+                        x_corn.append(self.msg_l.ranges[i]*math.cos(i*self.msg_l.angle_increment))
+                        y_corn.append(self.msg_l.ranges[i]*math.sin(i*self.msg_l.angle_increment))
+        
+                cov_corn = np.cov(x_corn,y_corn, bias=True)[0][1]
+                vari_corn = np.var(x_corn)
+                y_mean_corn = np.mean(y_corn)
+                x_mean_corn = np.mean(x_corn)
+            else:
+                self.boole_control_corner = 1
+    
+    #Per un muro alla destra del robot, devo prendere un raggio minore ed un suo precedente        
+        elif self.chiave == 'bright' and self.regions[self.chiave] < self.inf:
+            self.boole_control = 0
+            x = []
+            y = []
+            min_index = 211
+            max_index = 225
+            for i in range(min_index, max_index):
+                if 0.12 < self.msg_l.ranges[i] < 5:
+                    x.append(self.msg_l.ranges[i]*math.cos(i*self.msg_l.angle_increment))
+                    y.append(self.msg_l.ranges[i]*math.sin(i*self.msg_l.angle_increment))
+
+            cov = np.cov(x,y, bias=True)[0][1]
+            vari = np.var(x)
+            y_mean = np.mean(y)
+            x_mean = np.mean(x)
+
+            if self.regions['fleft'] < self.inf:
+                self.boole_control_corner = 0
+                self.check_angolo = False
+                x_corn = []
+                y_corn = []
+                min_index = 16
+                max_index = 45
+                for i in range(min_index, max_index):
+                    if 0.12 < self.msg_l.ranges[i] < 5:
+                        x_corn.append(self.msg_l.ranges[i]*math.cos(i*self.msg_l.angle_increment))
+                        y_corn.append(self.msg_l.ranges[i]*math.sin(i*self.msg_l.angle_increment))
+
+                cov_corn = np.cov(x_corn,y_corn,  bias=True)[0][1]
+                vari_corn = np.var(x_corn)
+                x_mean_corn = np.mean(x_mean)
+                y_mean_corn = np.mean(y_mean)
+
+            else:
+                self.boole_control_corner = 1
+
+        elif self.chiave == 'right' and self.regions[self.chiave] < self.inf:
+            self.boole_control = 0
+            x = []
+            y = []
+            min_index = 226
+            max_index = 315
+            for i in range(min_index, max_index):
+                if 0.12 < self.msg_l.ranges[i] < 5:
+                    x.append(self.msg_l.ranges[i]*math.cos(i*self.msg_l.angle_increment))
+                    y.append(self.msg_l.ranges[i]*math.sin(i*self.msg_l.angle_increment))
+
+            cov = np.cov(x,y, bias=True)[0][1]
+            vari = np.var(x)
+            x_mean = np.mean(x)
+            y_mean = np.mean(y)
+
+            if self.regions['fleft'] < self.inf:
+                self.boole_control_corner = 0
+                self.check_angolo = False
+                y_corn = []
+                x_corn = []
+                min_index = 16
+                max_index = 45
+                for i in range(min_index, max_index):
+                    if 0.12 < self.msg_l.ranges[i] < 5:
+                        x_corn.append(self.msg_l.ranges[i]*math.cos(i*self.msg_l.angle_increment))
+                        y_corn.append(self.msg_l.ranges[i]*math.sin(i*self.msg_l.angle_increment))
+
+                cov_corn = np.cov(x_corn,y_corn, bias=True)[0][1]
+                vari_corn = np.var(x_corn)
+                x_mean_corn = np.mean(x_corn)
+                y_mean_corn = np.mean(y_corn)
+
+            else:
+                self.boole_control_corner = 1 
+
+        elif self.chiave == 'fright' and self.regions[self.chiave] < self.inf:
+            self.boole_control = 0
+            x = []
+            y = []
+            min_index = 316
+            max_index = 345
+            for i in range(min_index, max_index):
+                    if 0.12 < self.msg_l.ranges[i] < 5:
+                        x.append(self.msg_l.ranges[i]*math.cos(i*self.msg_l.angle_increment))
+                        y.append(self.msg_l.ranges[i]*math.cos(i*self.msg_l.angle_increment))
+
+            cov = np.cov(x,y, bias=True)[0][1]
+            vari = np.var(x)
+            x_mean = np.mean(x)
+            y_mean = np.mean(y)        
+
+            if self.regions['fleft'] < self.inf:
+                self.boole_control_corner = 0
+                self.check_angolo = False
+                x_corn = []
+                y_corn = []
+                min_index = 16
+                max_index = 45
+                for i in range(min_index, max_index):
+                    if 0.12 < self.msg_l.ranges[i] < 5:
+                        x_corn.append(self.msg_l.ranges[i]*math.cos(i*self.msg_l.angle_increment))
+                        y_corn.append(self.msg_l.ranges[i]*math.sin(i*self.msg_l.angle_increment))
+
+                cov_corn = np.cov(x_corn,y_corn, bias=True)[0][1]
+                vari_corn = np.var(x_corn)
+                x_mean_corn = np.mean(x_corn)
+                y_mean_corn = np.mean(y_corn)
+
+            else:
+                self.boole_control_corner = 1
+
+        else:
+            self.boole_control = 1
+
+        if self.boole_control == 0:
+
+            self.coeff_ang = cov/vari         #definizione del coefficiente angolare della retta rappresentante il muro
+            self.y_x0 = y_mean - self.coeff_ang*x_mean
+        
+            if self.boole_control_corner == 0:
+                self.coeff_ang_corner = cov_corn/vari_corn
+                self.y_x0_corner = y_mean_corn - self.coeff_ang_corner*x_mean_corn
+            else:
+                self.coeff_ang_corner = 0
+                self.y_x0_corner = 0
+        else:
+
+            self.coeff_ang  = 0
+            self.y_x0 = 0
+            self.coeff_ang_corner = 0
+            self.y_x0_corner = 0
+    
+    #print("L'indice del raggio con valore minimo: ", min_index)
+    #print("L'indice del raggio successivo: ", succ_index)
+    #print("x1 vale ", x1)
+    #print("x2 vale ", x2)
+    #print("y1 vale ", y1)
+    #print("y2 vale ", y2)
+        print("Il valore del coefficiente angolare e' ", self.coeff_ang_corner)
+        print("Il valore di y_x0 e' ", self.y_x0_corner)
+
+
+
+    def callback_joy(self, msg1):
+            # Funzione di callback utilizzata per leggere i data pubblicati dal joypad sul topic joy, affinche' vengano utilizzati per
+            # per definire il punto che si vuole far raggiungere al robot attraverso la definizione di rho e theta. Nel caso di un Joystick Logitech Wireless Gamepad F710 attraverso il messaggio
+            # joy.axes[0] leggero' i valori di inclinazione dell'analogico sinistro, mentre tramite il messaggio joy.axes[1] e' possibile leggere 
+
+        self.msg_joy = msg1
+
+
+
+    def rho_and_theta(self):
+
+    
+        self.rho = math.sqrt(pow(self.msg_joy.axes[4],2) + pow(self.msg_joy.axes[3],2))   # ATTENZIONE: bisognerebbe moltiplicare il tutto per un coefficiente che rappresenti quanto equivalga in modulo massimo che possa avere rho. Sostanzialmente questa deve essere scalata 
+        self.theta = math.atan2(self.msg_joy.axes[3], self.msg_joy.axes[4])
+    
+        if self.rho != 0:
+            self.var_comand = False
+        else:
+            self.var_comand = True
+
+
+
+    def control_state(self):
+            # Funzione che attraverso i dati proveninenti dal joystick e dai coeffiecienti calcolati per definire la retta (muro),
+            # verifica se il punto che si vuole raggiungere sia o non sia accettabile
+    
+        rho_x = self.rho*math.cos(self.theta)
+        rho_y = self.rho*math.sin(self.theta)         #ottengo le componenti lungo x e y del vettore posizione imposto attraverso la leva di comando
+    
+        if self.wall_distance < self.regions['left'] and self.wall_distance < self.regions['right'] and self.regions['front'] < self.wall_distance*2:
+            max_rho_x = self.regions['front'] - (self.wall_distance + self.front_leng)
+            if max_rho_x > 0.05:
+                if rho_x > max_rho_x:
+                    rho_x = max_rho_x
+                    rho_y = 0           #se non dovessere funzionare, cancellare le 3 rho_y = 0 commentate
+                else: 
+                    rho_x = rho_x
+                    #rho_y = 0           #rho_y commentata
+            else:
+                if rho_x > 0:
+                    rho_x = 0
+                    rho_y = 0
+                else:
+                    rho_x = rho_x
+                    #rho_y = 0               #rho_y = 0
+        
+        
+                #print("il valore di rho_x e': ", rho_x)
+                #print("il valore di rho_y e': ", rho_y)
+            rospy.loginfo("Il robot e' perpendicolare al muro")
+    # Per shiftare la retta, se y_x0 e' positivo, a questo devo sottrargli un valore pari alla distanza desiderata tra le due rette diviso il seno del angolo corrispondente al coeffience
+    # angolare che caratterizza la retta del muro, moltiplicando il tutto poi per il coefficente angolare. Invece nel caso in cui y_x0 risultasse essere negativo, sara' necessario sommargli la medesima quantita' per effettuare lo shift. Quindi per 
+    # il calcolo della coordinata del muro shiftata mi bastera' calcolare l'equazione considerando i parametri caratterizzanti la retta ed la distanza desiderata.
+    #rospy.loginfo(coeff_ang)
+        else:
+            if self.y_x0 > 0:
+                y_wall_shif = self.coeff_ang*rho_x + self.y_x0 - (self.wall_distance/(math.sin(math.atan(self.coeff_ang))))*self.coeff_ang     # defizione y_wall gia' shiftata rispetto alla componente lungo l'asse x di rho nel caso in cui y_x0 > 0
+                #rospy.loginfo("y_x0 e' maggiore di 0")
+                #print('y_x0 vale ', y_x0)
+                #print('Coordinata y muro shiftata in funzione di rho_x', y_wall_shif)
+            elif self.y_x0 < 0:
+                y_wall_shif = self.coeff_ang*rho_x + self.y_x0 + (self.wall_distance/(math.sin(math.atan(self.coeff_ang))))*self.coeff_ang       # definizione di y_wall gia' shiftata rispetto alla componente lungo l'asse x di rho nel caso in cui y_x0 < 0
+                #rospy.loginfo("y_x0 e' minore di 0")
+                #print('y_x0 vale ', y_x0)
+                #print('Coordinata y muro shiftata in funzione di rho_x', y_wall_shif)
+            else:
+                y_wall_shif = 0
+                #print(y_wall_shif)   
+                # Effettuo due verifiche: innanzitutto vedo se sia la componente y di rho che sia la componente y_wall_shiftata sia minori di zero, in questo caso valuto i valori assoluti e non i valori reali.
+                # Il secondo controllo che effettuo, utile proprio alle necessita' del progetto, e' quello di verificare se la coordinata y che voglio raggiungere, vada oltre il muro. Nel caso in cui si vada oltre la retta rappresentate
+                # il muro shiftato, il valore verra' forzato a quello della retta.  
+    
+            if self.var_comand == False:
+                if y_wall_shif != 0 and self.y_x0 >= 0:   #verifica sulle condizioni quando retta rappresentante il muro abbia una q > 0
+
+                    if y_wall_shif > 0 and rho_y >= 0:
+                        if y_wall_shif > rho_y:
+                            rho_y = rho_y
+                        else:
+                            rho_y = y_wall_shif
+                            rospy.loginfo(1)
+            
+                    elif y_wall_shif < 0 and rho_y >= 0:
+                        rho_y = y_wall_shif
+                        rospy.loginfo(2)
+        
+                    elif y_wall_shif < 0 and rho_y <= 0:
+                        if abs(y_wall_shif) > abs(rho_y):
+                            rho_y = y_wall_shif
+                            rospy.loginfo(3)
+                        else:
+                            rho_y = rho_y
+
+                elif y_wall_shif != 0 and self.y_x0 < 0:   #verifica sulle condizioni quando la retta rappresentante il muro abbia una q < 0
+
+                    if y_wall_shif > 0 and rho_y <= 0:
+                        rho_y = y_wall_shif
+                        rospy.loginfo(4)
+
+                    elif y_wall_shif < 0 and rho_y <= 0:
+                        if abs(y_wall_shif) > abs(rho_y):
+                            rho_y = rho_y
+                        else:
+                            rho_y = y_wall_shif
+                            rospy.loginfo(5)
+
+                    elif y_wall_shif > 0 and rho_y >= 0:
+                        if y_wall_shif < rho_y:
+                            rho_y = rho_y
+                        else:
+                            rho_y = y_wall_shif
+                            rospy.loginfo(6)
+
+    
+
+
+            if self.check_angolo == False:
+                if self.y_x0_corner > 0:
+                    self.x_y0 = -(self.y_x0_corner - ((self.wall_distance + 0.05)/(math.sin(math.atan(self.coeff_ang_corner))))*self.coeff_ang_corner)/self.coeff_ang_corner
+                    self.x_y0_toll = -(self.y_x0_corner - ((self.wall_distance + 0.15)/(math.sin(math.atan(self.coeff_ang_corner))))*self.coeff_ang_corner)/self.coeff_ang_corner
+                elif self.y_x0_corner < 0:
+                    self.x_y0 = -(self.y_x0_corner + ((self.wall_distance + 0.05)/(math.sin(math.atan(self.coeff_ang_corner))))*self.coeff_ang_corner)/self.coeff_ang_corner
+                    self.x_y0_toll = -(self.y_x0_corner + ((self.wall_distance + 0.15)/(math.sin(math.atan(self.coeff_ang_corner))))*self.coeff_ang_corner)/self.coeff_ang_corner
+
+            if self.boole_control_corner == 1:
+                self.x_y0 = 0
+                self.x_y0_toll = 0
+    
+
+            print(self.x_y0)
+            print(self.x_y0_toll)    
+
+            if self.x_y0_toll < 0:
+                if rho_x > 0:
+                    rho_x = 0
+                    rho_y = 0
+                else:
+                    rho_x = rho_x
+                    rho_y = 0
+
+        self.x_des = rho_x
+        self.y_des = rho_y
+        #print('x desiderata vale ', x_des)
+        #print('y desidarata vale ', y_des)   
+        # rospy.loginfo(rho_x)
+        #rospy.loginfo(rho_y)
+        # rospy.loginfo(x_des)
+        #rospy.loginfo(y_des)
+    
+    
+
+    def control_action(self):
+            # Funzione che mi permette di definire l'azione di controllo da applicare al robot affinche' venga raggiunto
+            # il punto desiderato e venga annullato anche l'angolo tra l'asse Xr del robot e l'input di inclinazione assegnato.
+            # In particolare, attraverso l'uso di due semplici controlloro proporzionali (al momento tarati casualmente) e 
+            # calcolati gli errori attraverso il modulo del vettore ottenuto tramite le componenti x_des e y_des e definito
+            # l'angolo come l'atan2 delle due componenti
+
+        err_linear = math.sqrt(pow(self.x_des, 2) + pow(self.y_des, 2))
+        err_angular = math.atan2(self.y_des, self.x_des)
+
+            #print('Modulo dopo confronto', err_linear)
+            #print('Orientamento dopo confronto', err_angular)
+
+        move = Twist()
+        if self.x_des <= 0.05 and self.x_des >= -0.05 and self.y_des != 0:
+            move.linear.x = 0
+            move.angular.z = 0
+        else:
+            if self.x_des > 0:
+                move.linear.x = max(min(self.kp1*err_linear, self.max_speed_linear), -self.max_speed_linear)
+                move.angular.z = max(min(self.kp2*err_angular, self.max_speed_angular), -self.max_speed_angular)
+            elif self.x_des < 0 and self.regions['back'] > self.wall_distance + self.back_leng:
+                move.linear.x = -max(min(self.kp1*err_linear, self.max_speed_linear), -self.max_speed_linear)
+                if self.y_des > 0:
+                    move.angular.z = max(min(self.kp2*err_angular - math.pi, self.max_speed_angular), -self.max_speed_angular)
+                elif self.y_des < 0:
+                    move.angular.z = max(min(self.kp2*err_angular + math.pi, self.max_speed_angular), -self.max_speed_angular)
+            else:
+                move.linear.x = 0
+                move.angular.z = 0
+        return move
+    
+
+    def main(self):
+    
+        while not rospy.is_shutdown():
+            if self.msg_joy.header.stamp.secs != 0:
+                if self.msg_joy.header.seq != self.seq:
+                    self.retta_muro()
+                    self.rho_and_theta()
+                    self.control_state()
+                    move_main = Twist()
+                    move_main = self.control_action()         
+                    self.pub.publish(move_main)
+                    self.seq = self.msg_joy.header.seq
+                else:
+                    move_main = Twist()
+                    move_main.linear.x = 0
+                    move_main.angular.z = 0
+                    self.pub.publish(move_main)
+            self.rate.sleep()
+
+if __name__ == '__main__':
+    try:
+        diff_drive = Wall_following(0.5, 0.26, 1.82, 3.5, 0.28, 0.08, 0.21)
+        diff_drive.main()
+    except rospy.ROSInterruptException:
+        pass
+    
